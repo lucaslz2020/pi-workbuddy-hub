@@ -1,0 +1,20 @@
+{
+  // 类型检查专用（不参与发布）。本包不打包编译产物：src 直接是 pi 加载的 TS，
+  // 所以这里只做「能不能过」，没有任何 emit。
+  //
+  // 依赖解析：peer 依赖（@earendil-works/pi-ai、pi-coding-agent、@types/node）
+  // 由 pi 自己的安装提供。本地没装时先 `pnpm i` / `npm i --install-links`，
+  // 或在 CI 里装一次 peer 即可。
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "noUnusedLocals": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

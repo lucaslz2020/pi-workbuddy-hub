@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+# 运行时状态：绝不能提交
+failover.json
+workbuddy-checkin.json
+auth*.json
+at-rest-key
+
+# 本地隐私自检脚本：含作者标识原文，只存本地，不提交不发包
+bin/tidy.mjs

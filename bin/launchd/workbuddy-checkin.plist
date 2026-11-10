@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+
+  <!-- 直接启动 node，不经过 /bin/bash：macOS TCC 拒绝 launchd 拉起的 bash 读 ~/Documents，
+       而 node 进程已被授予该权限（这是 2026-11 岗位巡检踩过的坑）。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__ENTRY__</string>
+    <string>--json</string>
+  </array>
+
+  <!-- 每天 09:05。故意晚于 09:02 的岗位巡检，避免同时打满网络/CPU。 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>5</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__</string>
+
+  <!-- 机器早上没开机：launchd 会在下次唤醒后的第一次机会补跑 -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

@@ -1,0 +1,36 @@
+name: publish
+
+# 推 tag 即发布：git tag v0.4.1 && git push origin v0.4.1
+# 前提（一次性）：npm 包设置里配好 Trusted Publisher
+# （GitHub Actions / lucaslz2020 / pi-workbuddy-hub / publish.yml），
+# 之后全程 OIDC，不需要往 GitHub 存任何 token，也不受账号 2FA 影响。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # OIDC 可信发布 + provenance 需要
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org/'
+          cache: npm
+
+      - name: 版本一致性检查
+        run: |
+          test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}" || {
+            echo "tag ${GITHUB_REF_NAME} 与 package.json 版本不一致，拒绝发布"; exit 1; }
+
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --provenance --access public
