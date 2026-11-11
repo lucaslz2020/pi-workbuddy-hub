@@ -1,6 +1,6 @@
 name: publish
 
-# 推 tag 即发布：git tag v0.4.1 && git push origin v0.4.1
+# 推 tag 即发布：git tag v0.1.2 && git push origin v0.1.2
 # 前提（一次性）：npm 包设置里配好 Trusted Publisher
 # （GitHub Actions / lucaslz2020 / pi-workbuddy-hub / publish.yml），
 # 之后全程 OIDC，不需要往 GitHub 存任何 token，也不受账号 2FA 影响。
@@ -11,7 +11,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write # 创建 GitHub Release
   id-token: write # OIDC 可信发布 + provenance 需要
 
 jobs:
@@ -34,3 +34,12 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          printf 'npm: https://www.npmjs.com/package/pi-workbuddy-hub/v/%s\n\n完整变更见 [CHANGELOG](https://github.com/%s/blob/%s/CHANGELOG.md)\n' \
+            "$VERSION" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
