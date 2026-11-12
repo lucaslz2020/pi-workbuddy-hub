@@ -339,11 +339,45 @@ export function findAccounts(accounts: readonly Account[], target: string): Acco
     a.id === wanted || a.uid === wanted || (a.uin ?? '') === wanted || a.label.includes(wanted))
 }
 
+/** 来源优先级：账号簿（用户显式录入/刷新过，最新）> vault > 桌面端镜像。 */
+const SOURCE_RANK: Record<AccountSource, number> = { book: 2, vault: 1, desktop: 0 }
+
 /**
- * 全部账号，按 `id` 去重。
+ * 同一个人只留一条：`uid` 相同就是同一个号。
  *
- * 优先级：账号簿（用户显式录入/刷新过，最新）> vault > 桌面端镜像
- * （桌面端排最后，因为它是只读镜像，token 可能更旧）。
+ * 光按 `id` 去重不够 —— id 的口径是 `uin||uid`，同一个号从「只有 uid」的登录态
+ * 变成「带 uin」的登录态就会算成两个 id（`/wb status` 里两行一模一样的昵称与说明，
+ * 定时签到在两个 id 上各记一条）。所以先按 id 去重，再按「区域 + uid」合并，
+ * 留下 token 最新、来源更可信的那条（id 也跟着它走，切号/写回才不会落到旧文件上）。
+ */
+function mergeSameAccount(accounts: readonly Account[]): Account[] {
+  const byUid = new Map<string, Account>()
+  const anonymous: Account[] = []
+  for (const account of accounts) {
+    const uid = account.uid.trim()
+    if (uid === '') {
+      anonymous.push(account)
+      continue
+    }
+    const key = `${account.region}|${uid}`
+    const existing = byUid.get(key)
+    if (existing === undefined || preferredOver(account, existing)) byUid.set(key, account)
+  }
+  return [...anonymous, ...byUid.values()]
+}
+
+function preferredOver(candidate: Account, incumbent: Account): boolean {
+  const rank = SOURCE_RANK[candidate.source] - SOURCE_RANK[incumbent.source]
+  if (rank !== 0) return rank > 0
+  if (candidate.expiresAtMs !== incumbent.expiresAtMs) return candidate.expiresAtMs > incumbent.expiresAtMs
+  // 同一份 token 的两个副本：带 uin 的那条信息更全，id 也更稳
+  return (candidate.uin ?? '') !== '' && (incumbent.uin ?? '') === ''
+}
+
+/**
+ * 全部账号，按 `id` 去重，再按 `uid` 合并同一个号的重复记录。
+ *
+ * 优先级：账号簿 > vault > 桌面端镜像（桌面端排最后，因为它是只读镜像，token 可能更旧）。
  */
 export function listAccounts(): Account[] {
   const key = cachedAtRestKey()
@@ -356,7 +390,7 @@ export function listAccounts(): Account[] {
   }
   const desktop = readDesktopAccount(key).account
   if (desktop !== undefined && !byId.has(desktop.id)) byId.set(desktop.id, desktop)
-  return [...byId.values()].sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'))
+  return mergeSameAccount([...byId.values()]).sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'))
 }
 
 /**
