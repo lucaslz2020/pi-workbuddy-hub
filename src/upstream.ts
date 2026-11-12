@@ -102,6 +102,17 @@ export const CHECKIN_STATUS_PATHS: readonly string[] = [
 /** 领取今日积分（每个北京日只该成功一次）。 */
 export const DAILY_CHECKIN_PATH = '/v2/billing/meter/daily-checkin'
 
+/**
+ * 账号余额（剩余可用积分）。只读、不花钱。
+ *
+ * 与签到活动的 `total_credits` **不是一个口径**：那个是「这次签到活动累计发了多少」，
+ * 这个是「钱包/资源包里还剩多少」。两者都要看才算「有多少积分」。
+ */
+export const CREDITS_PATH = '/v2/billing/meter/get-user-resource'
+
+/** 企业成员的用量（没有 `/v2` 前缀）；剩余 = `limitNum - credit`。 */
+export const ENTERPRISE_CREDITS_PATH = '/billing/meter/get-enterprise-user-usage'
+
 // ---------------------------------------------------------------------------
 // 身份与超时
 // ---------------------------------------------------------------------------

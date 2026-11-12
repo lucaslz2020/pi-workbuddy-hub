@@ -29,6 +29,7 @@ import {
 import {
   BillingError,
   checkinAccount,
+  fetchCreditBalanceLookup,
   fetchStatus,
   isExpired,
   needsRefresh,
@@ -42,6 +43,10 @@ export interface RunOneResult {
   message: string
   credit?: number
   streakDays?: number
+  /** 钱包里剩余的可用积分（读不到就是 undefined，不影响本次结论）。 */
+  balance?: number
+  /** 没读到余额时的原因（`限流(429)`之类），有 `balance` 时不存在。 */
+  balanceReason?: string
   /** 本次是否续期过 token。 */
   refreshed: boolean
   /** token 剩余有效期天数（负数=已过期）。 */
@@ -143,10 +148,22 @@ function resultOf(
   }
 }
 
-/** 跑一个账号：续期 → 签到 → 失败重试。 */
+/** 跑一个账号：续期 → 签到 → 失败重试。返回值再补一次余额（只读、失败不算账）。 */
 async function runOne(account: Account, options: RunOptions): Promise<RunOneResult> {
-  const retries = options.retries ?? 2
   const keeper = keeperFor(account)
+  const result = await checkinOne(account, keeper, options)
+  // 余额：一次只读请求，失败就当不知道。排在结论之后，绝不影响签到结果。
+  // 没 refreshToken 且本地已过期时连请求都发不出去，就别白试一次
+  if (result.outcome === 'expired' && keeper.credential.refreshToken === '') return result
+  const lookup = await fetchCreditBalanceLookup(keeper.credential, options.signal)
+  if (lookup.balance === undefined) {
+    return lookup.reason === undefined ? result : { ...result, balanceReason: lookup.reason }
+  }
+  return { ...result, balance: lookup.balance.remaining }
+}
+
+async function checkinOne(account: Account, keeper: CredentialKeeper, options: RunOptions): Promise<RunOneResult> {
+  const retries = options.retries ?? 2
   const daysLeft = (): number | undefined => daysLeftOf(keeper.credential.expiresAtMs)
 
   // 1) 续期（本地快到期的才续，避免无谓请求）
@@ -253,20 +270,30 @@ export async function runMany(accounts: readonly Account[], options: RunOptions 
 export interface ProbeResult {
   account: Account
   status?: CheckinStatus
+  /** 钱包里剩余的可用积分（查不到就是 undefined）。 */
+  balance?: number
+  /** 没读到余额时的原因。 */
+  balanceReason?: string
   /** 查询失败时的原因（脱敏交给调用方）。 */
   error?: string
 }
 
-/** 只查状态，一个领奖请求都不发。 */
+/** 只查状态（+余额），一个领奖请求都不发。 */
 export async function probeMany(
   accounts: readonly Account[],
   options: { concurrency?: number, signal?: AbortSignal } = {},
 ): Promise<ProbeResult[]> {
   return mapWithConcurrency(accounts, options.concurrency ?? 3, async (account): Promise<ProbeResult> => {
+    // 状态与余额都是一个账号一次，串行发：上游对同 IP 并发敏感，先看到结论更重要
+    let balanceFields: Pick<ProbeResult, 'balance' | 'balanceReason'> = {}
+    const lookup = await fetchCreditBalanceLookup(account, options.signal)
+    if (lookup.balance !== undefined) balanceFields = { balance: lookup.balance.remaining }
+    else if (lookup.reason !== undefined) balanceFields = { balanceReason: lookup.reason }
+
     try {
-      return { account, status: await fetchStatus(account, options.signal) }
+      return { account, status: await fetchStatus(account, options.signal), ...balanceFields }
     } catch (error) {
-      return { account, error: asBillingError(error).message }
+      return { account, error: asBillingError(error).message, ...balanceFields }
     }
   })
 }
@@ -301,6 +328,23 @@ export function needsAttention(result: RunOneResult): boolean {
 /** 新领到的总积分。 */
 export function totalCredit(results: readonly RunOneResult[]): number {
   return results.reduce((sum, r) => sum + (r.outcome === 'claimed' ? r.credit ?? 0 : 0), 0)
+}
+
+/**
+ * 本次拿到的**可用积分总额**（钱包口径，各账号求和）。
+ *
+ * 只累加真的读到余额的账号 —— 读不到不能当 0 报，否则「5 个号」会变成
+ * 「一共 200 分」这种看着像真的假数。`accounts` 是跟着这个数走的可信度说明。
+ */
+export function totalBalance(results: readonly { balance?: number }[]): { total: number, accounts: number, known: number } {
+  let total = 0
+  let accounts = 0
+  for (const result of results) {
+    if (result.balance === undefined) continue
+    total += result.balance
+    accounts += 1
+  }
+  return { total: Math.round(total * 100) / 100, accounts, known: results.length }
 }
 
 // ---------------------------------------------------------------------------

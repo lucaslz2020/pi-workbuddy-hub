@@ -19,7 +19,9 @@ import {
   CODE_ENDED,
   CODE_INELIGIBLE,
   CN_BILLING_BASES,
+  CREDITS_PATH,
   DAILY_CHECKIN_PATH,
+  ENTERPRISE_CREDITS_PATH,
   JSON_TIMEOUT_MS,
   REFRESH_PATH,
   globalBase,
@@ -146,7 +148,7 @@ async function billingWithFallback(
   if (lastAnswer !== undefined && lastAnswer.json) return lastAnswer
   if (lastError instanceof Error) throw lastError
   throw new BillingError(
-    `签到接口返回了非 JSON（可能是网关/WAF 拦截），已试完所有基址/路径${
+    `计费接口返回了非 JSON（可能是网关/WAF 拦截），已试完所有基址/路径${
       lastAnswer === undefined ? '' : `（http ${lastAnswer.httpStatus}）`}`,
     { retryable: true },
   )
@@ -240,6 +242,155 @@ export async function claimDaily(credential: AccountCredential, signal?: AbortSi
     )
   }
   return { claimed: answer.code === 0, code: answer.code, ...optional('message', answer.message), data: answer.data }
+}
+
+// ---------------------------------------------------------------------------
+// 余额（钱包里还剩多少积分）
+// ---------------------------------------------------------------------------
+
+/**
+ * 账号当前可用积分。
+ *
+ * `remaining` 是「还能花多少」（钱包/资源包口径）；`periodCredits` 是签到活动
+ * 口径的累计（`total_credits`，见 `CheckinStatus`）。两个字段含义不同、可能同时
+ * 存在，所以分开报，绝不加在一起。
+ */
+export interface CreditBalance {
+  /** 剩余可用积分（所有未过期资源包求和）。 */
+  remaining: number
+  /** 明细条数（资源包条目），排障用。 */
+  packages?: number
+}
+
+/** 资源包条目里「还剩多少」：优先 Precise 字段，退化到整数，再按周期/总额切换。 */
+function packageRemain(raw: Record<string, unknown>): number {
+  const precise = (key: string): number | undefined => {
+    const value = raw[`${key}Precise`]
+    if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value)
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    return intOf(raw, key)
+  }
+  // 月度包按「本周期还剩」算，其它包按「总额还剩」算
+  const hasCycle = raw['CycleCapacityRemain'] !== undefined || raw['CycleCapacityRemainPrecise'] !== undefined
+  return Math.max(0, precise(hasCycle ? 'CycleCapacityRemain' : 'CapacityRemain') ?? 0)
+}
+
+/**
+ * 个人账号：`/v2/billing/meter/get-user-resource`，把未过期资源包的剩余累加。
+ *
+ * 上游把明细包在 `Response.Data.Accounts` 里（两层信封），所以这里不用
+ * `envelopeData` 那一层，直接按已知形状取；取不到就当「不知道」。
+ */
+function balanceOfUserResource(data: Record<string, unknown>): CreditBalance | undefined {
+  const response = data['Response']
+  const inner = typeof response === 'object' && response !== null && !Array.isArray(response)
+    ? (response as Record<string, unknown>)['Data']
+    : undefined
+  const accounts = typeof inner === 'object' && inner !== null && !Array.isArray(inner)
+    ? (inner as Record<string, unknown>)['Accounts']
+    : undefined
+  if (!Array.isArray(accounts)) return undefined
+
+  let remaining = 0
+  let packages = 0
+  for (const entry of accounts) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
+    const raw = entry as Record<string, unknown>
+    packages += 1
+    // 月度包即使剩余 0 也在列表里；非月度包剩 0 就是真的没有，跳过不影响求和
+    remaining += packageRemain(raw)
+  }
+  return { remaining, packages }
+}
+
+/** 企业成员：`limitNum - credit`。 */
+function balanceOfEnterprise(data: Record<string, unknown>): CreditBalance | undefined {
+  const wrapper = data['Data']
+  const inner = typeof wrapper === 'object' && wrapper !== null && !Array.isArray(wrapper)
+    ? wrapper as Record<string, unknown>
+    : data
+  const limit = intOf(inner, 'limitNum', 'LimitNum')
+  const used = intOf(inner, 'credit', 'Credit')
+  if (limit === undefined || used === undefined) return undefined
+  return { remaining: Math.max(0, limit - used) }
+}
+
+/** 上游的 Precise 字段带一串尾数（`4035.5700005`），报给人看只留 2 位。 */
+function roundCredits(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+/**
+ * 一次余额查询的结果。`reason` 只在没读到时存在 —— 它是「这次为什么不知道」，
+ * 而不是一个错误码：余额是展示项，读不到不该把签到/status 整个弄失败。
+ */
+export interface CreditLookup {
+  balance?: CreditBalance
+  /** 没读到时的原因（给人看，不含 token）。 */
+  reason?: string
+}
+
+/** 「这次没读到」分类成人话，避免「未知」看起来像「0 分」。 */
+function lookupFailureOf(answer: BillingAnswer): string {
+  if (answer.json === false) return `非 JSON（可能是网关/WAF 拦截，http ${answer.httpStatus}）`
+  if (answer.httpStatus === 401) return '登录态失效（http 401）'
+  if (answer.httpStatus === 429) return '上游限流（http 429）'
+  if (answer.httpStatus >= 500) return `上游 ${answer.httpStatus}`
+  if (answer.httpStatus >= 400) return `http ${answer.httpStatus}`
+  return `上游业务码 ${answer.code}`
+}
+
+/**
+ * 查账号剩余积分（只读、不花钱），并把失败原因带出来。
+ *
+ * 网关抖动/限流/非 JSON 重试一次再下结论；401 和业务码是「真实答案」，
+ * 重试只会把同一个答案再问一遍，所以不重试。
+ */
+export async function fetchCreditBalanceLookup(
+  credential: AccountCredential,
+  signal?: AbortSignal,
+): Promise<CreditLookup> {
+  const enterprise = credential.enterpriseId !== undefined && credential.enterpriseId !== ''
+  const paths = [enterprise ? ENTERPRISE_CREDITS_PATH : CREDITS_PATH]
+  let reason = '未知原因'
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const answer = await billingWithFallback(credential, paths, signal)
+      const definitive = answer.httpStatus === 401 || (answer.json && answer.httpStatus < 500)
+      if (answer.httpStatus >= 400 || answer.code !== 0) {
+        reason = lookupFailureOf(answer)
+        if (definitive) return { reason }
+      } else {
+        const balance = enterprise ? balanceOfEnterprise(answer.data) : balanceOfUserResource(answer.data)
+        if (balance !== undefined) {
+          return { balance: { ...balance, remaining: roundCredits(balance.remaining) } }
+        }
+        // 网关认了请求但没有资源包明细：重试也不会变，直接说清楚
+        return { reason: '上游返回里没有资源包明细' }
+      }
+    } catch (error) {
+      reason = error instanceof Error ? error.message : String(error)
+    }
+    if (attempt === 0 && signal?.aborted !== true) {
+      await new Promise<void>(resolve => { setTimeout(resolve, 400) })
+    }
+  }
+  return { reason }
+}
+
+/**
+ * 查账号剩余积分（只读、不花钱）。
+ *
+ * 与 `fetchStatus` 一样走 `billingWithFallback`：网关层失败才换基址/路径，401 与
+ * 业务码是真实答案。查询失败**不抛**，返回 `undefined` —— 余额只是展示项，
+ * 不能让「读不到余额」把一次签到/一次 status 整个弄失败。
+ */
+export async function fetchCreditBalance(
+  credential: AccountCredential,
+  signal?: AbortSignal,
+): Promise<CreditBalance | undefined> {
+  return (await fetchCreditBalanceLookup(credential, signal)).balance
 }
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,8 @@ export interface Row {
   region: string
   /** `剩 29.3 天` / `已过期 2.0 天` / `到期未知`。 */
   expiry: string
+  /** `4035.6` / `未知`。 */
+  credit: string
   /** `今日 已签 +100`。 */
   today: string
   /** 可用性说明（空 = 正常）。 */
@@ -62,16 +64,17 @@ export interface Row {
   details: string[]
 }
 
-/** 账号总览表（`/wb status`）。 */
-export function overviewTable(title: string, rows: readonly Row[]): string[] {
+/** 账号总览表（`/wb status`）。`footnote` 排在表尾（合计行）。 */
+export function overviewTable(title: string, rows: readonly Row[], footnote: readonly string[] = []): string[] {
   const lines = [title, '']
-  lines.push(`    ${fit('账号', 22)}${pad('区域', 8)}${pad('token', 14)}${pad('今日', 18)}状态`)
+  lines.push(`    ${fit('账号', 22)}${pad('区域', 8)}${pad('token', 14)}${pad('积分', 10)}${pad('今日', 18)}状态`)
   for (const row of rows) {
     // 当前号标记并进定宽的名字格，避免它把后面所有列挤歪
     lines.push(
-      `  ${fit(`${row.mark} ${row.name}`, 22)}${pad(row.region, 8)}${pad(row.expiry, 14)}${pad(row.today, 18)}${row.status}`,
+      `  ${fit(`${row.mark} ${row.name}`, 22)}${pad(row.region, 8)}${pad(row.expiry, 14)}${pad(row.credit, 10)}${pad(row.today, 18)}${row.status}`,
     )
   }
+  if (footnote.length > 0) lines.push('', ...footnote)
   return lines
 }
 
@@ -79,7 +82,7 @@ export function overviewTable(title: string, rows: readonly Row[]): string[] {
 export function doctorBlock(row: Row): string[] {
   return [
     `${row.mark === ' ' ? '' : `${row.mark} `}${row.name}`,
-    `    ${row.region} · ${row.expiry} · ${row.today}${row.status === '' ? '' : ` · ⚠ ${row.status}`}`,
+    `    ${row.region} · ${row.expiry} · 积分 ${row.credit} · ${row.today}${row.status === '' ? '' : ` · ⚠ ${row.status}`}`,
     ...row.details.map(line => `    ${line}`),
   ]
 }

@@ -21,7 +21,7 @@ import { findAccounts, listAccounts, prepareAccounts } from '../src/accounts.ts'
 import { displayContext, pad, resolveMaskLevel } from '../src/mask.ts'
 import { beijingDay } from '../src/time.ts'
 import { outcomeIcon, regionLabel } from '../src/view.ts'
-import { needsAttention, probeMany, runMany, summarize, totalCredit } from '../src/runner.ts'
+import { needsAttention, probeMany, runMany, summarize, totalBalance, totalCredit } from '../src/runner.ts'
 
 const USAGE = `wb-checkin — 多账号 WorkBuddy 每日签到
 
@@ -37,6 +37,11 @@ const USAGE = `wb-checkin — 多账号 WorkBuddy 每日签到
 签到日按北京时间（UTC+8）划分。`
 
 const NAME_WIDTH = 18
+
+/** 余额显示：未读到就是「未知」，不是 0。值已由 checkin.ts 收敛到两位小数。 */
+function creditText(balance) {
+  return balance === undefined ? '未知' : String(balance)
+}
 
 /** 解析命令行。只认长选项与 `-c/-n/-h`，未知参数忽略（launchd 常带多余参数）。 */
 function parseArgs(argv) {
@@ -58,22 +63,27 @@ function parseArgs(argv) {
 /** 只查不领：一行一个账号的今日状态。 */
 async function runDryRun(selected, ui, options, day) {
   const probes = await probeMany(selected, { concurrency: options.concurrency })
-  const rows = probes.map(({ account, status, error }) => ({
+  const rows = probes.map(({ account, status, error, balance, balanceReason }) => ({
     id: account.id,
     label: ui.name(account),
     region: account.region,
+    balance,
+    ...(balanceReason === undefined ? {} : { balanceReason }),
     ...(error === undefined
       ? {
           active: status?.active,
           todayCheckedIn: status?.todayCheckedIn,
           streakDays: status?.streakDays,
           todayCredit: status?.todayCredit,
+          totalCredits: status?.totalCredits,
         }
       : { error: ui.scrub(error) }),
   }))
+  const balance = totalBalance(rows)
+  const missing = [...new Set(rows.map(row => row.balanceReason).filter(reason => reason !== undefined))]
 
   if (options.json) {
-    process.stdout.write(`${JSON.stringify({ day, dryRun: true, accounts: rows }, null, 2)}\n`)
+    process.stdout.write(`${JSON.stringify({ day, dryRun: true, credits: balance, accounts: rows }, null, 2)}\n`)
   } else {
     process.stdout.write(`多账号 WorkBuddy 签到状态（${day}，北京时区）— 未发任何领奖请求\n\n`)
     for (const row of rows) {
@@ -88,9 +98,12 @@ async function runDryRun(selected, ui, options, day) {
         : '无进行中的活动'
       process.stdout.write(
         `${outcomeIcon(row.active && row.todayCheckedIn ? 'done' : 'inactive')} `
-        + `${pad(row.label, NAME_WIDTH)} ${pad(regionLabel(row.region), 7)} ${state}\n`,
+        + `${pad(row.label, NAME_WIDTH)} ${pad(regionLabel(row.region), 7)} ${pad(`积分 ${creditText(row.balance)}`, 14)} ${state}\n`,
       )
     }
+    const suffix = balance.accounts === balance.known ? '' : `（${balance.accounts}/${balance.known} 个账号读到余额）`
+    process.stdout.write(`\n积分合计：${balance.accounts === 0 ? '未知（余额接口没有应答）' : `${creditText(balance.total)}${suffix}`}\n`)
+    if (missing.length > 0) process.stdout.write(`余额没读到：${missing.join('；')}\n`)
   }
   return rows.some(row => row.error !== undefined) ? 1 : 0
 }
@@ -141,6 +154,7 @@ async function main() {
   })
 
   const gained = totalCredit(results)
+  const balance = totalBalance(results)
   const bad = results.filter(needsAttention).length
 
   if (options.json) {
@@ -148,6 +162,7 @@ async function main() {
       day,
       summary: summarize(results),
       gained,
+      credits: balance,
       failures: bad,
       accounts: results.map(result => ({
         id: result.account.id,
@@ -155,6 +170,8 @@ async function main() {
         region: result.account.region,
         outcome: result.outcome,
         credit: result.credit,
+        balance: result.balance,
+        ...(result.balanceReason === undefined ? {} : { balanceReason: result.balanceReason }),
         streakDays: result.streakDays,
         daysLeft: result.daysLeft,
         refreshed: result.refreshed,
@@ -165,6 +182,12 @@ async function main() {
     process.stdout.write(`\n${summarize(results)}`)
     if (gained > 0) process.stdout.write(`，本次合计 +${gained} 积分`)
     process.stdout.write('\n')
+    if (balance.accounts > 0) {
+      const suffix = balance.accounts === balance.known ? '' : `（${balance.accounts}/${balance.known} 个账号读到余额）`
+      process.stdout.write(`当前可用积分：${creditText(balance.total)}${suffix}\n`)
+    }
+    const missing = [...new Set(results.map(result => result.balanceReason).filter(reason => reason !== undefined))]
+    if (missing.length > 0) process.stdout.write(`余额没读到：${missing.join('；')}\n`)
   }
 
   return bad > 0 ? 1 : 0

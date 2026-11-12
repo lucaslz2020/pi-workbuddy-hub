@@ -40,7 +40,7 @@ import {
   resetFaults,
   type FaultVerdict,
 } from './failover.ts'
-import { BillingError, refreshCredential } from './checkin.ts'
+import { BillingError, fetchCreditBalanceLookup, refreshCredential, type CreditLookup } from './checkin.ts'
 import { beijingDay } from './time.ts'
 import { displayContext, resolveMaskLevel, type DisplayContext, type MaskLevel } from './mask.ts'
 import {
@@ -48,6 +48,7 @@ import {
   needsAttention,
   runMany,
   summarize,
+  totalBalance,
   totalCredit,
 } from './runner.ts'
 import {
@@ -141,17 +142,68 @@ function todayText(account: Account, records: Record<string, DayRecord>): string
   return `${prefix} ${outcomeText(record.outcome)}${credit}`
 }
 
-function rowOf(account: Account, ctx: DisplayContext, records: Record<string, DayRecord>): Row {
+function rowOf(account: Account, ctx: DisplayContext, records: Record<string, DayRecord>, balance?: number): Row {
   const availability = isAvailable(account)
   return {
     mark: isActive(account) ? '◉' : ' ',
     name: ctx.name(account),
     region: regionLabel(account.region),
     expiry: expiryText(account),
+    credit: creditText(balance),
     today: todayText(account, records),
     status: availability.ok ? '' : (availability.reason ?? '不可用'),
     details: [],
   }
+}
+
+/**
+ * 余额的显示值。`未知` 与 `0` 是两件事：读不到接口不能报成「一分钱没有」。
+ * 上游的值是小数（`4035.57`），已经是两位以内，直接照原样打，不四舍五入 ——
+ * 否则一列数字加起来对不上合计行。
+ */
+function creditText(balance: number | undefined): string {
+  return balance === undefined ? '未知' : String(balance)
+}
+
+/**
+ * 并发探一下每个账号的余额；单个读不到就带出原因，绝不抛。
+ *
+ * 限 3 并发：上游对同 IP 并发敏感，一口气把四个号十二条请求全发出去，
+ * 回来的可能就是几个 429 和不必要的「未知」。
+ */
+async function balancesOf(accounts: readonly Account[]): Promise<CreditLookup[]> {
+  const lookups: CreditLookup[] = new Array(accounts.length)
+  let cursor = 0
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor++
+      if (index >= accounts.length) return
+      lookups[index] = await fetchCreditBalanceLookup(accounts[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(3, accounts.length) }, () => worker()))
+  return lookups
+}
+
+/** 合计行：只算真读到余额的账号；没读到的说清楚「为什么不知道」。 */
+function totalCreditText(accounts: readonly Account[], lookups: readonly CreditLookup[]): string {
+  const { total, accounts: counted } = totalBalance(lookups.map(lookup => ({ balance: lookup.balance?.remaining })))
+  if (counted === 0) {
+    return '  积分合计：未知（余额接口没有应答）'
+      + reasonsText(lookups)
+  }
+  const suffix = counted === lookups.length ? '' : `（${counted}/${lookups.length} 个账号读到余额）`
+  return `  积分合计：${creditText(total)}${suffix}${reasonsText(lookups)}`
+}
+
+/** 把「没读到」的原因归类成一句，挂在合计行后面。 */
+function reasonsText(lookups: readonly CreditLookup[]): string {
+  const reasons = lookups.map(lookup => lookup.reason).filter((reason): reason is string => reason !== undefined)
+  if (reasons.length === 0) return ''
+  const counts = new Map<string, number>()
+  for (const reason of reasons) counts.set(reason, (counts.get(reason) ?? 0) + 1)
+  const parts = [...counts].map(([reason, count]) => (count > 1 ? `${count} 个账号：${reason}` : reason))
+  return `\n  余额没读到：${parts.join('；')}`
 }
 
 /** 展开 `~`，诊断里不打印完整家目录。 */
@@ -182,11 +234,14 @@ async function showStatus(ctx: HubContext, state: HubState): Promise<void> {
   }
   const ui = display(state, accounts)
   const records = readRecords()
-  const rows = accounts.map(account => rowOf(account, ui, records))
+  // 余额是现查的（只读、不花钱）：这是「现在有多少积分」唯一的真实口径
+  const lookups = await balancesOf(accounts)
+  const rows = accounts.map((account, index) => rowOf(account, ui, records, lookups[index]?.balance?.remaining))
   ctx.ui.notify([...overviewTable(
     `WorkBuddy 账号中枢 · ${beijingDay()}（北京时区）`,
     rows,
-  ), '', '  ◉ = pi 正在使用的 provider 账号', '  /wb sign 批量签到 · /wb use 切换 · /wb failover 看故障与自动换号'].join('\n'), 'info')
+    [totalCreditText(accounts, lookups)],
+  ), '', '  ◉ = pi 正在使用的 provider 账号', '  积分 = 账号当前可用余额（钱包口径），不是签到活动累计得分', '  /wb sign 批量签到 · /wb use 切换 · /wb failover 看故障与自动换号'].join('\n'), 'info')
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +293,15 @@ async function runSign(ctx: HubContext, args: string, state: HubState): Promise<
 /** 「签到完成：…」+ 「需要处理：」两段。定时签到也用它。 */
 function summaryBlock(results: readonly import('./runner.ts').RunOneResult[], ui: DisplayContext): string {
   const gained = totalCredit(results)
+  const balance = totalBalance(results)
   const bad = results.filter(needsAttention)
   const lines = [`签到完成：${summarize(results)}${gained > 0 ? `，合计 +${gained} 积分` : ''}`]
+  if (balance.accounts > 0) {
+    lines.push(`当前可用积分：${creditText(balance.total)}`
+      + (balance.accounts === balance.known ? '' : `（${balance.accounts}/${balance.known} 个账号读到余额）`))
+  }
+  const missing = results.map(result => result.balanceReason).filter((reason): reason is string => reason !== undefined)
+  if (missing.length > 0) lines.push(`余额没读到：${[...new Set(missing)].join('；')}`)
   if (bad.length > 0) {
     lines.push('', '需要处理：')
     for (const result of bad) lines.push(`  ${outcomeIcon(result.outcome)} ${ui.name(result.account)}：${ui.scrub(result.message)}`)
@@ -590,15 +652,17 @@ async function showDoctor(ctx: HubContext, state: HubState): Promise<void> {
   } else {
     lines.push(`账号：${accounts.length} 个`)
     const records = readRecords()
-    for (const account of accounts) {
+    const lookups = await balancesOf(accounts)
+    for (const [index, account] of accounts.entries()) {
       lines.push(...doctorBlock({
-        ...rowOf(account, ui, records),
+        ...rowOf(account, ui, records, lookups[index]?.balance?.remaining),
         details: [
           `${sourceLabel(account.source)} · refreshToken ${account.refreshToken === '' ? '无' : '有'}`,
           shortPath(account.filePath),
         ],
       }))
     }
+    lines.push(totalCreditText(accounts, lookups))
   }
 
   if (desktop.account !== undefined) {

@@ -1,6 +1,6 @@
 {
   "name": "pi-workbuddy-hub",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "WorkBuddy（CodeBuddy）一体化中枢：内置 provider（国内/国际双区域）+ 多账号签到、切换、限流自动换号",
   "type": "module",
   "license": "MIT",

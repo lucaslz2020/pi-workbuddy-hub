@@ -361,9 +361,30 @@ function mergeSameAccount(accounts: readonly Account[]): Account[] {
     }
     const key = `${account.region}|${uid}`
     const existing = byUid.get(key)
-    if (existing === undefined || preferredOver(account, existing)) byUid.set(key, account)
+    byUid.set(key, existing === undefined ? account : mergePair(existing, account))
   }
   return [...anonymous, ...byUid.values()]
+}
+
+/**
+ * 同一个号的两条记录合成一条：身份/凭据按 `preferredOver`，**昵称取桌面端那条**。
+ *
+ * 为什么要单独借昵称：vault 里的昵称是扫码那一刻的快照，用户后来在客户端改了名
+ * （`Alice199` → `Alice1999`）它不会变，于是列表里显示的是个早就没人用的名字，
+ * 看着就像「这个号没加进来」。桌面端 live 文件是登录时现写的，昵称才是当前的。
+ *
+ * 只借昵称、不借身份：id / token / 来源仍跟着 winner 走，否则签到记录会换 key。
+ */
+function mergePair(incumbent: Account, candidate: Account): Account {
+  const winner = preferredOver(candidate, incumbent) ? candidate : incumbent
+  const freshest = (candidate.source === 'desktop' ? candidate : incumbent.source === 'desktop' ? incumbent : undefined)
+  if (freshest === undefined || freshest.label === '' || freshest.label === winner.label) return winner
+  return {
+    ...winner,
+    ...optional('nickname', freshest.nickname),
+    ...optional('displayName', freshest.displayName),
+    label: freshest.label,
+  }
 }
 
 function preferredOver(candidate: Account, incumbent: Account): boolean {
