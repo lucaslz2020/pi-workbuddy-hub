@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.1.4] — 2026-11-13
+
+### 修复
+
+- **切换账号后请求仍然是上一个号发出的**（「切了成功但还是失败」）：
+  `/wb use` 与自动改号写的三处（vault、provider 刷新副本、`auth.json`）都是对的，
+  但 provider 的 `WorkBuddyCredentialStore` 在**进程内缓存**着上一次解析结果，
+  而用来丢缓存的那个「公开入口」一直是空转：
+  - 旧实现读 `modelRegistry.getRegisteredNativeProvider(id).oauth.refreshToken()`；
+  - 本包用 legacy 的 `pi.registerProvider(id, config)` 注册，它落在 registry 的
+    `extensionProviders` 里，而 native getter 读的是 `nativeExtensionProviders` ——
+    对这个 provider **永远返回 `undefined`**；
+  - 于是回调静默 `return false`，缓存一点没动：界面报「已切换」，之后的请求
+    继续用旧 token，新号一直「失败」。
+
+  现在改为 provider 模块直接导出 `invalidateCredentialCache(providerId)`
+  （`src/provider/register.ts`），由 `index.ts` 注入给 `switch.ts`，不再依赖上下文里
+  有什么、也不再依赖 registry 的内部形态。失效真的失败时，`/wb use` 会明确说
+  「请 `/reload` 或重启 pi」而不是含糊的「可能要 reload 才生效」。
+  - 顺手修掉 `/wb logout` 清凭据后没有清目录时间戳（`catalogFetchedAt`）——
+    登出后重新登录可能拿到旧的模型目录缓存。
+  - **缓存改成了「会自己校对」的**：只修失效入口还不够——若写文件的是别的上下文
+    （另一个 pi 窗口、hook、手改 `auth.json`），本进程的缓存还是旧的。现在
+    `resolve()` 每次先比对一次磁盘上的 uid 指纹（刷新副本 + auth.json 槽位），
+    变了就自动重解析。比较的是 uid 而不是 token，所以正常的 token 续期不会触发重读。
+  - 新增回归测试 `test/switch-invalidate.test.mjs`（`npm test` 会跑）：
+    验证「跨上下文改磁盘 → 缓存让位」、「同 uid 续期不重读」、
+    「`invalidateCredentialCache()` → 下一次请求真的换号」以及
+    「native getter 拿不到 legacy 注册的 provider」这个根因。
+
 ## [0.1.3] — 2026-11-12
 
 ### 新增

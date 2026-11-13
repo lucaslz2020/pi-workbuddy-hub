@@ -116,18 +116,21 @@ pi 没有「请求失败换凭据重试」的公开接口，所以分三层挂�
 | 响应后 | `after_provider_response` | 429/401/5xx → 立刻判定并记故障 |
 | 消息结束 | `message_end` | 从 `stopReason=error` 的 `errorMessage` 里认限流/额度/失效 |
 
-### 切换为什么需要三步
+### 切换为什么需要四步
 
 ```
 ① 写 vault（~/.pi/agent/workbuddy/workbuddy-vault/<region>/<id>.json）
-② 写 auth.json（provider 槽位）
-③ 调 provider 的 oauth.refreshToken() 逼它丢缓存
+② 写 provider 刷新副本（workbuddy/auth.<region>.json）
+③ 写 auth.json（provider 槽位）
+④ 丢 provider 的进程内凭据缓存
 ```
 
-**①不能省**：provider 的 `pickBest()` 让 vault 排在 auth.json 之前，只改 auth.json 会被静默覆盖。
-**③不能省**：`WorkBuddyCredentialStore` 在进程内缓存解析结果，不失效的话它继续用旧 token——表现就是「切换成功但账号没变」。
+**①②不能省**：provider 的 `pickBest()` 让刷新副本与 vault 都排在 auth.json 之前，只改 auth.json 会被静默覆盖。
+**④不能省**：`WorkBuddyCredentialStore` 在进程内缓存解析结果，不丢的话它继续用旧 token —— 表现就是「切换成功但账号没变」，而且新号一直失败（请求其实是旧号发的）。
 
-`store.invalidate()` 是内部方法，扩展拿不到。唯一可用的公开入口是 `provider.oauth.refreshToken()`（它第一行就是 `invalidate()`），通过 `ctx.modelRegistry.getRegisteredNativeProvider()` 拿到。全走公开 API，provider 升级不会轻易打断。
+丢缓存走 provider 模块自己的 `invalidateCredentialCache()`，**不再**绕 `ctx.modelRegistry.getRegisteredNativeProvider()`：本包用 legacy 的 `pi.registerProvider(id, config)` 注册，条目落在 registry 的 `extensionProviders` 里，而 `getRegisteredNativeProvider()` 读的是 `nativeExtensionProviders` —— 对这类注册永远返回 `undefined`，于是那条路一直在静默空转（0.1.4 修掉）。
+
+另外缓存会**自己校对**：`resolve()` 每次先比对磁盘上的 uid 指纹（刷新副本 + auth.json 槽位），变了就重解析。所以另一个 pi 窗口里切号、或手改了 auth.json，本进程下一次请求也会跟上。比较的是 uid 而不是 token，正常续期不会触发重读。
 
 **实测**：切换后 `pi -p --model workbuddy/glm-5.3` 立即用新号返回。
 
@@ -298,7 +301,8 @@ node bin/checkin.mjs --only 主账号
 ## 开发
 
 ```bash
-npm test        # 类型检查 + bin 语法检查（CI 与 prepublishOnly 都跑这个）
+npm test        # 类型检查 + bin 语法检查 + 单元测试（CI 与 prepublishOnly 都跑这个）
+npm run unittest # 只跑 test/*.test.mjs
 npm run tidy    # 发布前隐私自检（本地手动跑）
 ```
 

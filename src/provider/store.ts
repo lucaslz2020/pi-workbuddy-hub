@@ -12,6 +12,7 @@
  * （与 CLIs 签到共用同一个实现）。
  */
 
+import { join } from 'node:path'
 import {
   readDesktopCredential,
   readOwnCredential,
@@ -21,9 +22,12 @@ import {
   type ReadCredentialResult,
   type WorkBuddyCredential,
 } from './auth.ts'
-import { accountIdOf } from '../accounts.ts'
+import { accountIdOf, piAgentDir } from '../accounts.ts'
 import { isExpired, needsRefresh, refreshCredential } from '../checkin.ts'
 import { ensureAtRestKey } from '../at-rest.ts'
+import { isPlainObject, readJsonObject } from '../jsonfile.ts'
+// provider id ↔ 区域只有一份定义（账号层用同一对 id 操作 auth.json）
+import { PROVIDER_IDS } from '../switch.ts'
 import { CHAT_PATH, regionOf, type Region } from './upstream.ts'
 
 export interface WorkBuddyAuthStatus {
@@ -42,6 +46,16 @@ export class WorkBuddyCredentialStore {
   /** 上一次解析出来的凭据，按区域缓存。 */
   private resolved: WorkBuddyCredential | undefined
 
+  /**
+   * 缓存建立时磁盘上「现在是谁」的指纹（刷新副本 uid + auth.json 槽位 uid）。
+   *
+   * 缓存不能盲信 `resolved`：切换账号是**另一个上下文**（`/wb use`、hook、甚至
+   * 另一个 pi 进程）写的文件。只要写的人没经过本进程的 `invalidate()`，下一次请求
+   * 就会带着旧 token 发出去 —— 界面说切了，服务端报的却是上一个号的错。
+   * 所以每次 `resolve()` 先拿磁盘指纹校对一次，变了就重解析。
+   */
+  private resolvedFrom: string | undefined
+
   constructor(
     private readonly region: Region,
     private readonly log?: (message: string) => void,
@@ -55,7 +69,9 @@ export class WorkBuddyCredentialStore {
    * 解决下一次请求要用的凭据；过期就续期。什么都没有时抛一条能照做的错。
    */
   async resolve(): Promise<WorkBuddyCredential> {
-    if (this.resolved !== undefined && !needsRefresh(this.resolved)) return this.resolved
+    if (this.resolved !== undefined && !needsRefresh(this.resolved) && this.stillCurrent()) {
+      return this.resolved
+    }
 
     const key = await ensureAtRestKey()
     const desktop = readDesktopCredential(this.region, key)
@@ -83,7 +99,29 @@ export class WorkBuddyCredentialStore {
     }
 
     this.resolved = credential
+    this.resolvedFrom = this.fingerprintOf()
     return credential
+  }
+
+  /**
+   * 磁盘上「当前号」还是不是缓存里那一份。
+   *
+   * 比的是 uid 而不是 token：token 会被续期正常改写（那不该触发重解析），
+   * 而换号**一定**换 uid。磁盘读不到（全被删/权限）不算变化 —— 那属于「无凭据」，
+   * 让续期/报错那条路去说，别在这里把缓存白白丢掉。
+   */
+  private stillCurrent(): boolean {
+    const current = this.fingerprintOf()
+    if (current === undefined || this.resolvedFrom === undefined) return true
+    return current === this.resolvedFrom
+  }
+
+  /** `刷新副本 + auth.json` 里声明的当前 uid（两个都没写就是 undefined）。 */
+  private fingerprintOf(): string | undefined {
+    const own = readOwnCredential(this.region)?.uid ?? ''
+    const slotUid = authSlotUid(this.region) ?? ''
+    if (own === '' && slotUid === '') return undefined
+    return `${own}|${slotUid}`
   }
 
   /** 当前状态，不发网络请求（at-rest 密钥会按需探测一次）。 */
@@ -106,6 +144,7 @@ export class WorkBuddyCredentialStore {
   /** 丢掉缓存的解析结果（凭据被上游拒绝之后）。 */
   invalidate(): void {
     this.resolved = undefined
+    this.resolvedFrom = undefined
   }
 
   /**
@@ -120,6 +159,8 @@ export class WorkBuddyCredentialStore {
       this.log?.(`vault 写失败（本次登录重启后丢失）：${error instanceof Error ? error.message : String(error)}`)
     }
     this.resolved = credential
+    // 登录写入的凭据同样要带上指纹，否则下一次 resolve() 会以为「磁盘变了」而重读
+    this.resolvedFrom = this.fingerprintOf()
     return accountId
   }
 }
@@ -145,6 +186,19 @@ function pickBest(
   // 排序：来源优先（已吊销的备份 expiresAt 可以很远，绝不能拿过期时间当主序）
   return candidates.sort((a, b) => SOURCE_RANK[a.source] - SOURCE_RANK[b.source]
     || b.expiresAtMs - a.expiresAtMs)[0]
+}
+
+/**
+ * `~/.pi/agent/auth.json` 里这个 provider 声明的 uid ——— 只为了校对缓存。
+ *
+ * 只读一个字段：换号一定会同时改写它，所以一个 uid 就足够判断，
+ * 不必把整份凭据（含 token）读出来。缺失一律 undefined（还没登录就是这样）。
+ */
+function authSlotUid(region: Region): string | undefined {
+  const slot = readJsonObject(join(piAgentDir(), 'auth.json'))[PROVIDER_IDS[region]]
+  if (!isPlainObject(slot)) return undefined
+  const uid = slot['uid']
+  return typeof uid === 'string' && uid.trim() !== '' ? uid : undefined
 }
 
 // ---------------------------------------------------------------------------

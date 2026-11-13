@@ -12,18 +12,24 @@
  * ## 为什么切换后必须让 provider 重新读
  *
  * `WorkBuddyCredentialStore` 在**进程内缓存**解析结果。只改 auth.json 而不让
- * 缓存失效，provider 会继续用旧 token 发请求 —— 表现就是「切换成功但账号没变」。
- * 而 `store.invalidate()` 是 provider 的内部方法，扩展拿不到。
+ * 缓存失效，provider 会继续用旧 token 发请求 —— 表现就是「切换成功但账号没变」，
+ * 而且新账号一直失败（请求实际上还是旧号发的）。
  *
- * 唯一可用的公开失效入口是 **`provider.oauth.refreshToken()`**：它第一行就是
- * `store.invalidate()`，然后重新走「plugin 副本 → 桌面端 → vault → auth.json」
- * 的优先级链。
+ * 失效走 provider 模块导出的 `invalidateCredentialCache()`（见
+ * `src/provider/register.ts`），由 index.ts 在启动时注入到本文件 —— 这里不直接
+ * import，避免与 provider 互相依赖。
  *
- * 所以「激活账号」= ① 写进 vault（对应区域）② 写进 auth.json 槽位
- * ③ 调一次 `refreshToken()` 逼缓存失效。三步缺一不可。
+ * 曾经走的 **`provider.oauth.refreshToken()`** 路线不成立：本包用
+ * `pi.registerProvider(id, config)`（legacy 形态）注册，它落在 modelRegistry 的
+ * `extensionProviders` 里，而 `getRegisteredNativeProvider(id)` 读的是
+ * `nativeExtensionProviders` —— 对 legacy 注册永远是 `undefined`。那条路拿到
+ * 空对象直接返回 false，缓存一点没动，于是「切了但号没变」永远修不掉。
  *
- * 为什么①也要做：provider 的 `pickBest()` 让 vault 排在 auth.json 之前，
- * 只写 auth.json 会被 vault 里的旧账号**静默覆盖**。
+ * 所以「激活账号」= ① 写进 vault（对应区域）② 写进刷新副本 ③ 写进 auth.json
+ * ④ 调 `invalidateCredentialCache()` 丢缓存。缺任何一步都是假切换。
+ *
+ * 为什么①也要做：provider 的 `pickBest()` 让刷新副本与 vault 都排在 auth.json
+ * 之前，只写 auth.json 会被它们**静默覆盖**。
  */
 
 import { join } from 'node:path'
@@ -187,6 +193,8 @@ function activateStorage(account: Account): ActivateResult {
 /**
  * provider 的凭据解析器句柄。由 index.ts 在注册时塞进来 ——
  * 这里不直接 import provider，避免耦合它的内部路径。
+ *
+ * 返回 false = 「没能让 provider 丢掉缓存」。
  */
 export type CredentialRefresher = (providerId: string, ctx?: unknown) => Promise<boolean>
 
@@ -207,12 +215,18 @@ export async function activateAccount(account: Account, ctx?: unknown): Promise<
   if (!result.ok) return result
   if (refresher === undefined) return { ...result, message: `${result.message}。` }
 
+  let invalidated = false
   try {
-    await refresher(result.providerId, ctx)
+    invalidated = await refresher(result.providerId, ctx)
   } catch {
-    return { ...result, message: `${result.message}；但让 provider 失效缓存失败，可能要 /reload 才生效` }
+    invalidated = false
   }
-  return { ...result, message: `${result.message}。` }
+  return invalidated
+    ? { ...result, message: `${result.message}。` }
+    : {
+        ...result,
+        message: `${result.message}；但没能让 provider 丢掉凭据缓存，下一次请求可能仍用旧号 —— 请 /reload 或重启 pi 后再试`,
+      }
 }
 
 /** 切换成功与否的校验：auth.json 里真的变成这个 uid 了吗。 */

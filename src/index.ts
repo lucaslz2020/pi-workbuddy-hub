@@ -16,9 +16,12 @@
  * | 响应后 | `after_provider_response` | 429/5xx/401 → 立刻判定并记故障 |
  * | 消息结束 | `message_end` | 从 `stopReason=error` 的 `errorMessage` 里认出限流/额度/失效 |
  *
- * 切号本身会写 vault + auth.json + provider 刷新副本，并调 provider 的
- * `oauth.refreshToken()` 强制丢缓存（详见 switch.ts）。所以**下一次尝试就用新号**，
- * 而不是等重启。
+ * 切号本身会写 vault + 刷新副本 + auth.json，并调 provider 模块的
+ * `invalidateCredentialCache()` 丢掉进程内缓存（详见 switch.ts）。所以**下一次尝试
+ * 就用新号**，而不是等重启。
+ *
+ * （旧实现靠 `provider.oauth.refreshToken()` 失效缓存，但那条路对 legacy 注册的
+ * provider 永远是 `undefined`，于是切号只改文件、请求继续走旧号 —— 已修。）
  *
  * 认不出来的错误一律**不切号** —— 换号解决不了的问题，换号只会白烧所有号的额度。
  *
@@ -33,7 +36,7 @@
  * | `accounts.ts` | 账号池：三条来源、解析/序列化、签到记录 |
  * | `checkin.ts` | 签到协议 + token 续期（唯一一份） |
  * | `runner.ts` | 一个账号怎么跑、批量并发、兜底重试 |
- * | `switch.ts` | 切号的三个步骤 |
+ * | `switch.ts` | 切号的四个步骤 |
  * | `failover.ts` | 错误 → 故障判定 + 冷却状态 |
  * | `view.ts` / `mask.ts` | 排版 / 脱敏 |
  * | `commands.ts` | `/wb` 的每个子命令 |
@@ -57,7 +60,7 @@ import { classifyError, clearFault, isAvailable, pickNextAccount, setActiveUidLo
 import { displayContext, resolveMaskLevel } from './mask.ts'
 import { accountsPendingToday } from './runner.ts'
 import { activateAccount, activeUidFor, setCredentialRefresher } from './switch.ts'
-import registerWorkBuddyProviders from './provider/register.ts'
+import registerWorkBuddyProviders, { invalidateCredentialCache } from './provider/register.ts'
 
 const LOG = '[workbuddy-hub]'
 
@@ -84,7 +87,7 @@ function hubContext(ctx: ExtensionContext): HubContext {
       confirm: (title, message) => ctx.ui.confirm(title, message),
       input: (title, placeholder) => ctx.ui.input(title, placeholder),
     },
-    // 原始上下文只给 provider 的 refreshToken() 逼缓存失效用（它要读 modelRegistry）
+    // 原始上下文：`/login`、refresh/logout 与切号都可能要读 provider 侧状态
     raw: ctx,
     // `reload` 只在命令上下文里有，hook 上下文没有
     ...(typeof maybeReload === 'function'
@@ -100,8 +103,8 @@ export default async function workbuddyHub(pi: ExtensionAPI): Promise<void> {
   // 生成模型列表（`pi --list-models` 甚至不等任何异步）。注册竞态会让 provider 装好
   // 了但模型列表为空。
   //
-  // 也必须在 `/wb` 之前：切号的「第③步 让 provider 丢缓存」依赖 provider 已经注册进
-  // modelRegistry，否则拿到的是空，切换后会继续用旧 token。
+  // 也必须在 `/wb` 之前：切号的「第④步 让 provider 丢缓存」作用在 provider 模块自己的
+  // stores 上；provider 没注册起来就没人调 resolve，切号后第一次请求还是从磁盘现读。
   await prepareAccounts().catch((error: unknown) => {
     console.warn(`${LOG} at-rest 密钥探测失败:`, error instanceof Error ? error.message : error)
   })
@@ -111,35 +114,15 @@ export default async function workbuddyHub(pi: ExtensionAPI): Promise<void> {
 
   const state = initialState()
 
-  // ---- ② 让 switch.ts 能通过 provider 的公开入口失效缓存 ----
+  // ---- ② 让 switch.ts 能丢掉 provider 进程内的凭据缓存 ----
   //
-  // ctx.modelRegistry.getRegisteredNativeProvider(id) 拿到 provider，再调它的
-  // oauth.refreshToken()：那个方法第一行就是 store.invalidate()，随后重新按
-  // 「plugin 副本 → 桌面端 → vault → auth.json」解析。是唯一不必碰内部的失效入口。
-  const warnedNoRegistry = new Set<string>()
-  setCredentialRefresher(async (providerId, ctx) => {
-    try {
-      const registry = (ctx as {
-        modelRegistry?: { getRegisteredNativeProvider?: (id: string) => unknown }
-      } | undefined)?.modelRegistry
-      const provider = registry?.getRegisteredNativeProvider?.(providerId) as
-        | { oauth?: { refreshToken?: (credentials: unknown, signal?: AbortSignal) => Promise<unknown> } }
-        | undefined
-      const refresh = provider?.oauth?.refreshToken
-      if (typeof refresh !== 'function') {
-        // hook 上下文可能没有 modelRegistry：这时切号只改文件，provider 缓存不断
-        if (!warnedNoRegistry.has(providerId)) {
-          warnedNoRegistry.add(providerId)
-          console.warn(`${LOG} ${providerId} 缓存失效跳过：上下文里没有 modelRegistry，切号后仍可能用旧 token 到下次自然失效`)
-        }
-        return false
-      }
-      await refresh({ type: 'oauth', access: '', refresh: '', expires: 0, domain: '', uid: '' })
-      return true
-    } catch {
-      return false
-    }
-  })
+  // 以前走的是 `ctx.modelRegistry.getRegisteredNativeProvider(id).oauth.refreshToken()`：
+  // 本包用 `pi.registerProvider(id, config)`（legacy 形态）注册，它落在 modelRegistry 的
+  // `extensionProviders` 里，而 `getRegisteredNativeProvider(id)` 读的是
+  // `nativeExtensionProviders` —— 对 legacy 注册永远是 undefined。于是那条路一直在
+  // 「跳过缓存失效」，切号只改了文件：**界面说切了，请求还是旧号发的，新号一直失败**。
+  // 现在直接从 provider 模块拿 stores 的失效入口，不再依赖上下文里有什么。
+  setCredentialRefresher(async (providerId) => invalidateCredentialCache(providerId))
 
   // failover 用注入的回调查「谁是当前号」，避免与 switch 循环依赖
   setActiveUidLookup(activeUidFor)

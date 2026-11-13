@@ -60,6 +60,37 @@ function storeFor(region: Region): WorkBuddyCredentialStore {
   return store
 }
 
+/** providerId → 区域；不是本扩展注册的 provider 返回 undefined。 */
+function regionOfProvider(providerId: string): Region | undefined {
+  return REGIONS.find(region => PROVIDER_IDS[region] === providerId)
+}
+
+/**
+ * 丢掉 provider 进程内的凭据缓存，让下一次请求重新按磁盘（vault / 刷新副本 / auth.json）解析。
+ *
+ * **切号必须调它**：`WorkBuddyCredentialStore` 把上一次解析结果留在 `resolved` 里，
+ * 只改文件不动缓存，请求就继续用上一个号的 token —— 表现正是「切换成功了但账号没变、
+ * 而且新号一直失败」。
+ *
+ * 走这里而不是 `provider.oauth.refreshToken()`：本包用 `pi.registerProvider(id, config)`
+ * 注册（legacy 形态），它落在 modelRegistry 的 `extensionProviders` 里，
+ * 而 `getRegisteredNativeProvider(id)` 读的是 `nativeExtensionProviders` —— 对 legacy
+ * 注册永远是 `undefined`。于是「用公开入口失效缓存」那条路一直静默失败。
+ *
+ * 返回 false 表示 providerId 不属于本扩展（缓存一定没动）。
+ */
+export function invalidateCredentialCache(providerId?: string): boolean {
+  if (providerId === undefined) {
+    for (const region of REGIONS) stores.get(region)?.invalidate()
+    return true
+  }
+  const region = regionOfProvider(providerId)
+  if (region === undefined) return false
+  // store 还没建 = 还没有缓存可丢；下次 resolve 本来就会读磁盘
+  stores.get(region)?.invalidate()
+  return true
+}
+
 // ---------------------------------------------------------------------------
 // 模型目录
 // ---------------------------------------------------------------------------
@@ -289,6 +320,7 @@ export function clearLocalCredentials(target: string): string {
     clearStoredCredentials(region)
     stores.get(region)?.invalidate()
     catalogs.delete(region)
+    catalogFetchedAt.delete(region)
   }
   return regions.map(region => PROVIDER_IDS[region]).join(', ')
 }
