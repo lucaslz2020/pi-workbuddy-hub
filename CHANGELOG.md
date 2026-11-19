@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.5] — 2026-11-17
+
+### 修复
+
+- **调试日志与故障提示不再干扰别的 provider**（[#1](https://github.com/lucaslz2020/pi-workbuddy-hub/issues/1)）：
+  hook 是全局的，以前 `after_provider_response` / `message_end` 无条件
+  `console.warn` 事件 keys，并且对所有 provider 的 429/5xx/401 都会走 WorkBuddy 的
+  故障判定 —— 于是用 anthropic 等模型时，TUI 上会冒出
+  `[workbuddy-hub] hook after_provider_response 事件 keys: …`，还会弹
+  「上游模型负载高，与账号无关；退避重试（不换号）」这种把别人的故障算到
+  WorkBuddy 头上的提示，甚至可能把 WorkBuddy 的号记成故障/切走。
+  - 三个 hook（`before_agent_start` / `after_provider_response` / `message_end`）现在
+    只对 `workbuddy` / `workbuddy-global` 的请求生效；认不出 provider 一律不管（宁可少管一次）。
+  - 归因用**发请求的那个 provider**：`message_end` 取 `assistant.provider`（异步切模型也不会误判），
+    `after_provider_response` 的事件没有 provider 字段，取 `before_provider_request` 记下的那次请求；
+    账号也从该 provider 的 `auth.json` 槽位反查，不再拿「随便第一个当前号」。
+  - 自动换号限定在**同一个 provider** 内找备用号：模型绑在 provider 上，把国内号写进国际槽位
+    并不会让下一次请求换号，只会报一个假的「已切换」。没有同区域备用号时如实提示。
+- **调试日志默认关闭**：`[workbuddy-hub] hook …` 只在 `PI_WORKBUDDY_DEBUG=1`（或 `WORKBUDDY_DEBUG=1`）
+  时输出，且同样只对本扩展的 provider 生效。
+- 新增回归测试 `test/hook-scope.test.mjs`：非 WorkBuddy 请求无日志/无提示/不记账；
+  WorkBuddy 请求照旧提示并按 provider 归因；`message_end` 以消息自带的 provider 为准；
+  调试日志默认关闭、开了也只对本扩展输出。
+
 ## [0.1.4] — 2026-11-13
 
 ### 修复

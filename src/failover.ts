@@ -213,12 +213,14 @@ export function isAvailable(account: Account, now: number = Date.now()): Availab
 /**
  * 按「可用性 → 剩余有效期」挑下一个号。
  *
- * 优先同区域（省掉切 provider 的心智负担），没有可用的同区域号才跨区域兜底；
- * 剩余有效期长的优先（更可能还没被限流过）。
+ * 默认优先同区域（省掉切 provider 的心智负担），没有可用的同区域号才跳区域兜底。
+ * 自动故障转移传 `sameProvider: true`：模型是绑在 provider 上的，把国内号写到国际号的
+ * 槽位上不会让「下一次请求」换号，只会报一个假的「已切换」。跨区域要换的是模型，
+ * 不是凭据，那应该由人决定。
  */
 export function pickNextAccount(
   accounts: readonly Account[],
-  options: { from?: Account, now?: number } = {},
+  options: { from?: Account, now?: number, sameProvider?: boolean } = {},
 ): Account | undefined {
   const now = options.now ?? Date.now()
   const usable = accounts.filter(a => !isActiveAccount(a) && isAvailable(a, now).ok)
@@ -226,6 +228,7 @@ export function pickNextAccount(
   const sameRegion = options.from === undefined
     ? usable
     : usable.filter(a => providerIdFor(a) === providerIdFor(options.from!))
+  if (options.sameProvider === true && options.from !== undefined && sameRegion.length === 0) return undefined
   const pool = sameRegion.length > 0 ? sameRegion : usable
   return [...pool].sort((a, b) => b.expiresAtMs - a.expiresAtMs)[0]
 }

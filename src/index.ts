@@ -46,8 +46,8 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { listAccounts, prepareAccounts } from './accounts.ts'
 import {
+  accountForProvider,
   completions,
-  currentAccount,
   dispatch,
   handleFault,
   initialState,
@@ -59,22 +59,59 @@ import {
 import { classifyError, clearFault, isAvailable, pickNextAccount, setActiveUidLookup } from './failover.ts'
 import { displayContext, resolveMaskLevel } from './mask.ts'
 import { accountsPendingToday } from './runner.ts'
-import { activateAccount, activeUidFor, setCredentialRefresher } from './switch.ts'
+import { activateAccount, activeUidFor, PROVIDER_IDS, setCredentialRefresher } from './switch.ts'
 import registerWorkBuddyProviders, { invalidateCredentialCache } from './provider/register.ts'
 
 const LOG = '[workbuddy-hub]'
 
-/** hook 收到的事件只打一次 keys（值不打，防 token/uid 进日志），方便对 pi 的实际形状。 */
+/**
+ * 开发调试日志默认**关闭**：只有显式设置 `PI_WORKBUDDY_DEBUG=1`（或 `WORKBUDDY_DEBUG=1`）才输出。
+ *
+ * 以前 hook 无条件 `console.warn`，装了这个扩展的任何会话都会在 TUI 上多出两行
+ * `[workbuddy-hub] hook …`，与用户当前用的 provider 毫无关系。（issue #1）
+ */
+function debugEnabled(): boolean {
+  const raw = process.env['PI_WORKBUDDY_DEBUG'] ?? process.env['WORKBUDDY_DEBUG'] ?? ''
+  const value = raw.trim().toLowerCase()
+  return value !== '' && value !== '0' && value !== 'false' && value !== 'off' && value !== 'no'
+}
+
+/** hook 收到的事件（调试用）每个只打一次 keys；值不打，防 token/uid 进日志。 */
 const loggedHookShapes = new Set<string>()
-function logHookShape(name: string, event: unknown): void {
-  if (loggedHookShapes.has(name)) return
+function logHookShape(name: string, event: unknown, providerId: string): void {
+  if (!debugEnabled() || loggedHookShapes.has(name)) return
   loggedHookShapes.add(name)
   try {
     const keys = event !== null && typeof event === 'object' ? Object.keys(event).join(',') : typeof event
-    console.warn(`${LOG} hook ${name} 事件 keys: ${keys}`)
+    console.warn(`${LOG} hook ${name} 事件 keys: ${keys}（provider: ${providerId}）`)
   } catch {
     // 打不出就不打
   }
+}
+
+/** 本扩展注册的两个 provider id（`workbuddy` / `workbuddy-global`）。 */
+const WORKBUDDY_PROVIDER_IDS: ReadonlySet<string> = new Set(Object.values(PROVIDER_IDS))
+
+/**
+ * 这次请求是不是 WorkBuddy 的？
+ *
+ * 认不出 provider 一律按「不是」处理 —— 宁可少管一次，也不要把别的 provider 的
+ * 故障记到 WorkBuddy 账号头上、或替它换号。
+ */
+function isWorkBuddyProvider(providerId: string | undefined): providerId is string {
+  return providerId !== undefined && WORKBUDDY_PROVIDER_IDS.has(providerId)
+}
+
+/**
+ * 从事件/消息上读这次请求的 provider，读不到退回 `ctx.model`。
+ *
+ * `message_end` 的 assistant 消息带 `provider`（就是发出这次请求的那个），
+ * 比 `ctx.model` 更可靠：异步切模型时 `ctx.model` 可能已经不是发请求的那个了。
+ */
+function providerOfEvent(source: unknown, ctx: ExtensionContext): string | undefined {
+  const stamped = (source as { provider?: unknown } | null | undefined)?.provider
+  if (typeof stamped === 'string' && stamped !== '') return stamped
+  return ctx.model?.provider
 }
 
 /** pi 的扩展上下文 → 命令层的最小接口。 */
@@ -162,12 +199,28 @@ export default async function workbuddyHub(pi: ExtensionAPI): Promise<void> {
   }
 
   // ---- ④ hooks ----
+  //
+  // 下面三个 hook 都会被**所有** provider 的请求触发。先确认「这次请求是不是本扩展
+  // 的 provider」，再做日志/记故障/换号 —— 否则别的 provider 的 429/401 会被记到
+  // WorkBuddy 账号上，甚至把号切走（issue #1）。
+  //
+  // `after_provider_response` 的事件只有 `status` / `headers`，没有 provider，所以
+  // 在 `before_provider_request` 里记下这次请求实际用的 provider；`message_end`
+  // 优先用消息自带的 `provider` 戳。
+  let inFlightProvider: string | undefined
+
+  pi.on('before_provider_request', (_event, ctx) => {
+    inFlightProvider = ctx.model?.provider
+  })
+
   pi.on('before_agent_start', async (_event, ctx) => {
     if (!state.autoFailover) return
+    const providerId = ctx.model?.provider
+    if (!isWorkBuddyProvider(providerId)) return
     const accounts = listAccounts()
-    const account = currentAccount(accounts)
+    const account = accountForProvider(providerId)
     if (account === undefined || isAvailable(account).ok) return
-    const next = pickNextAccount(accounts, { from: account })
+    const next = pickNextAccount(accounts, { from: account, sameProvider: true })
     if (next === undefined) return
     // ctx 必须透传：provider 缓存失效要读 modelRegistry，没有它切换只是改文件
     // 注意：这里不记 lastSwitch —— 预换之后这次请求的失败属于新号，要正常归因
@@ -177,20 +230,26 @@ export default async function workbuddyHub(pi: ExtensionAPI): Promise<void> {
   })
 
   pi.on('after_provider_response', async (event, ctx) => {
-    logHookShape('after_provider_response', event)
+    const providerId = inFlightProvider ?? ctx.model?.provider
+    if (!isWorkBuddyProvider(providerId)) return
+    logHookShape('after_provider_response', event, providerId)
     const status = (event as { status?: number }).status ?? 0
     if (status !== 429 && status !== 401 && status < 500) return
-    const account = currentAccount()
+    const account = accountForProvider(providerId)
     if (account === undefined) return
     const verdict = classifyError({ status })
     if (verdict !== undefined) await handleFault(hubContext(ctx), state, account, verdict)
   })
 
   pi.on('message_end', async (event, ctx) => {
-    logHookShape('message_end', event)
-    const message = (event as { message?: { role?: string, stopReason?: string, errorMessage?: string } }).message
+    const message = (event as {
+      message?: { role?: string, provider?: string, stopReason?: string, errorMessage?: string }
+    }).message
     if (message?.role !== 'assistant') return
-    const account = currentAccount()
+    const providerId = providerOfEvent(message, ctx)
+    if (!isWorkBuddyProvider(providerId)) return
+    logHookShape('message_end', event, providerId)
+    const account = accountForProvider(providerId)
     if (account === undefined) return
 
     if (message.stopReason !== 'error') {
@@ -198,6 +257,7 @@ export default async function workbuddyHub(pi: ExtensionAPI): Promise<void> {
       clearFault(account)
       return
     }
+
     const errorMessage = message.errorMessage ?? ''
     if (errorMessage === '') return
     const verdict = classifyError({ message: errorMessage })

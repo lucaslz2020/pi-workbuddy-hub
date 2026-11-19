@@ -386,6 +386,16 @@ export function currentAccount(accounts: readonly Account[] = listAccounts()): A
 }
 
 /**
+ * 这个 provider 槽位现在挂着哪个号。
+ *
+ * 自动故障转移必须按「发请求的那个 provider」找账号：两个区域各有一个槽位，
+ * 拿 `currentAccount()` 可能拿到另一个区域的号，把故障记错人、乃至换错槽位（issue #1）。
+ */
+export function accountForProvider(providerId: string): Account | undefined {
+  return listAccounts().find(account => providerIdFor(account) === providerId && isActive(account))
+}
+
+/**
  * 401 先救号：refreshToken 能换出新 AT，说明只是 token 过期、号本身没废 ——
  * 救回来、清掉故障记录，不记永久 revoked。救不回来才按原 verdict 处理。
  */
@@ -439,11 +449,11 @@ export async function handleFault(ctx: HubContext, state: HubState, account: Acc
     return false
   }
 
-  const next = pickNextAccount(listAccounts(), { from: account })
+  const next = pickNextAccount(listAccounts(), { from: account, sameProvider: true })
   if (next === undefined) {
     ctx.ui.notify(
       `⚠ ${ui.name(account)}：${active.detail}\n`
-      + '但已经**没有可用的备用账号**了（全部在冷却/需重登）。用 /wb failover 看详情，'
+      + `但 ${providerIdFor(account)} 上已经**没有可用的备用账号**了（全部在冷却/需重登）。用 /wb failover 看详情，`
       + '或 /wb failover reset 清掉冷却。',
       'error',
     )

@@ -116,6 +116,19 @@ pi 没有「请求失败换凭据重试」的公开接口，所以分三层挂�
 | 响应后 | `after_provider_response` | 429/401/5xx → 立刻判定并记故障 |
 | 消息结束 | `message_end` | 从 `stopReason=error` 的 `errorMessage` 里认限流/额度/失效 |
 
+**这三个 hook 只对 `workbuddy` / `workbuddy-global` 的请求生效**：pi 的 hook 是全局的，
+别的 provider 的 429/401/5xx 不该被记到 WorkBuddy 账号上，更不该触发换号或弹 WorkBuddy 的提示。
+判断依据优先用事件自带的 provider（`message_end` 的 `assistant.provider`），`after_provider_response`
+的事件没有 provider 字段，就用 `before_provider_request` 记下的那次请求的 provider。
+
+调试日志（`[workbuddy-hub] hook … 事件 keys: …`）**默认关闭**，需要时：
+
+```bash
+PI_WORKBUDDY_DEBUG=1 pi
+```
+
+即使开了 debug，也只在本扩展自己的 provider 请求上输出。
+
 ### 切换为什么需要四步
 
 ```
